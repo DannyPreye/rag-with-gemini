@@ -80,8 +80,6 @@ export class DocumentProcessor
     {
         const fileExtension = path.extname(file.originalname).toLowerCase();
 
-        console.log("This is the fileExtension", fileExtension);
-
         let loader;
 
         switch (fileExtension) {
@@ -397,13 +395,27 @@ export class DocumentProcessor
                 return null;
             }
 
-            const tempFilePath = path.join(tempDir, path.basename(file.Key));
+            // Create unique filename to avoid conflicts
+            const uniquePrefix = Date.now() + '-' + Math.random().toString(36).substring(2, 15);
+            const tempFilePath = path.join(tempDir, `${uniquePrefix}-${path.basename(file.Key)}`);
+
+            // Ensure the temp directory exists
+            await fs.mkdir(tempDir, { recursive: true });
 
             // Create a write stream to download file to disk
-            await pipeline(
-                response.Body as Readable,
-                createWriteStream(tempFilePath)
-            );
+            const writeStream = createWriteStream(tempFilePath);
+
+            try {
+                await pipeline(
+                    response.Body as Readable,
+                    writeStream
+                );
+            } catch (error) {
+                console.error(`Pipeline error for ${file.Key}:`, error);
+                // Clean up the partially downloaded file
+                await fs.unlink(tempFilePath).catch(() => { });
+                throw error;
+            }
 
             const fileStat = await fs.stat(tempFilePath);
 
@@ -432,7 +444,7 @@ export class DocumentProcessor
                     mimetype: mimetype,
                     size: fileStat.size,
                     destination: tempDir,
-                    filename: path.basename(file.Key),
+                    filename: path.basename(tempFilePath),
                     path: tempFilePath,
                     buffer: Buffer.from([]),
                     stream: new Readable()
@@ -440,6 +452,9 @@ export class DocumentProcessor
 
                 return multerFile;
             }
+
+            // Clean up if file is empty
+            await fs.unlink(tempFilePath).catch(() => { });
             return null;
 
         } catch (error) {
@@ -447,6 +462,7 @@ export class DocumentProcessor
             return null;
         }
     }
+
     async refresh(namespace: string, newFiles: Express.Multer.File[] = []): Promise<any>
     {
         const startTime = Date.now();
@@ -485,13 +501,13 @@ export class DocumentProcessor
                 const s3Objects = await s3Client.send(listCommand);
                 const existingFiles = s3Objects.Contents || [];
 
-                console.log("existing file", existingFiles);
+
 
                 // Process existing files with proper stream handling
                 for (const file of existingFiles) {
                     const multerFile = await this.downloadFileFromS3(s3Client, file, tempDir);
 
-                    console.log("This is the multerFile", multerFile);
+
 
 
                     if (multerFile) {
