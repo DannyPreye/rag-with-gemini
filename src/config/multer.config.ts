@@ -57,7 +57,7 @@ export async function uploadToS3(filePath: string, originalname: string, namespa
 {
     const fileContent = await fs.readFile(filePath);
     const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    const key = `documents/${namespace}/${uniqueSuffix}-${path.basename(originalname.replace(/ /g, '-'))}`;
+    const key = `documents/${namespace}/${path.basename(originalname.replace(/ /g, '-'))}`;
 
     await s3Client.send(new PutObjectCommand({
         Bucket: config.aws.bucketName,

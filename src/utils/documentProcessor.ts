@@ -27,11 +27,6 @@ import { TokenTracker } from "./tokenTracker.js";
 
 
 
-
-
-
-
-
 interface ProcessingResult
 {
     documentId: string;
@@ -83,25 +78,24 @@ export class DocumentProcessor
 
     private async extractTextFromFile(file: Express.Multer.File): Promise<Document[]>
     {
-        const fileType = file.mimetype;
+        const fileExtension = path.extname(file.originalname).toLowerCase();
+
+        console.log("This is the fileExtension", fileExtension);
 
         let loader;
 
-
-        switch (fileType) {
-
-            case 'application/pdf':
-
+        switch (fileExtension) {
+            case '.pdf':
                 loader = new PDFLoader(file.path);
                 break;
-            case 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
+            case '.docx':
                 loader = new DocxLoader(file.path);
                 break;
-            case 'text/plain':
+            case '.txt':
                 loader = new TextLoader(file.path);
                 break;
             default:
-                throw new Error('Unsupported file type');
+                throw new Error(`Unsupported file type: ${fileExtension}`);
         }
 
         return await loader.load();
@@ -383,6 +377,76 @@ export class DocumentProcessor
             throw new Error("Failed to generate response");
         }
     }
+
+    private async downloadFileFromS3(s3Client: S3Client, file: any, tempDir: string): Promise<Express.Multer.File | null>
+    {
+        if (!file.Key) {
+            console.error("Invalid S3 object key", file);
+            return null;
+        }
+
+        try {
+            const getObjectCommand = new GetObjectCommand({
+                Bucket: config.aws.bucketName,
+                Key: file.Key
+            });
+
+            const response = await s3Client.send(getObjectCommand);
+            if (!response.Body) {
+                console.error("S3 object body is null:", file.Key);
+                return null;
+            }
+
+            const tempFilePath = path.join(tempDir, path.basename(file.Key));
+
+            // Create a write stream to download file to disk
+            await pipeline(
+                response.Body as Readable,
+                createWriteStream(tempFilePath)
+            );
+
+            const fileStat = await fs.stat(tempFilePath);
+
+            // Determine mimetype based on file extension
+            const fileExtension = path.extname(file.Key).toLowerCase();
+            let mimetype;
+            switch (fileExtension) {
+                case '.pdf':
+                    mimetype = 'application/pdf';
+                    break;
+                case '.docx':
+                    mimetype = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+                    break;
+                case '.txt':
+                    mimetype = 'text/plain';
+                    break;
+                default:
+                    mimetype = 'application/octet-stream';
+            }
+
+            if (fileStat.size > 0) {
+                const multerFile: Express.Multer.File = {
+                    fieldname: 'file',
+                    originalname: path.basename(file.Key),
+                    encoding: '7bit',
+                    mimetype: mimetype,
+                    size: fileStat.size,
+                    destination: tempDir,
+                    filename: path.basename(file.Key),
+                    path: tempFilePath,
+                    buffer: Buffer.from([]),
+                    stream: new Readable()
+                };
+
+                return multerFile;
+            }
+            return null;
+
+        } catch (error) {
+            console.error("Error downloading file from s3", file.Key, error);
+            return null;
+        }
+    }
     async refresh(namespace: string, newFiles: Express.Multer.File[] = []): Promise<any>
     {
         const startTime = Date.now();
@@ -421,54 +485,32 @@ export class DocumentProcessor
                 const s3Objects = await s3Client.send(listCommand);
                 const existingFiles = s3Objects.Contents || [];
 
+                console.log("existing file", existingFiles);
+
                 // Process existing files with proper stream handling
                 for (const file of existingFiles) {
-                    if (!file.Key) continue;
+                    const multerFile = await this.downloadFileFromS3(s3Client, file, tempDir);
 
-                    try {
-                        const getObjectCommand = new GetObjectCommand({
-                            Bucket: config.aws.bucketName,
-                            Key: file.Key
-                        });
-
-                        const response = await s3Client.send(getObjectCommand);
-                        if (!response.Body) continue;
-
-                        console.log("response body", response.Body);
-
-                        const tempFilePath = path.join(tempDir, path.basename(file.Key));
+                    console.log("This is the multerFile", multerFile);
 
 
-                        await pipeline(
-                            response.Body as Readable,
-                            createWriteStream(tempFilePath)
-                        );
+                    if (multerFile) {
+                        try {
+                            const result = await this.processDocument(multerFile, namespace);
+                            totalChunks += result.metadata.totalChunks;
+                            totalTokens += result.metadata.totalTokens;
+                            processedFiles++;
+                        } catch (error: any) {
+                            errors.push({
+                                // @ts-ignore
+                                file: file.Key,
+                                error: error.message
+                            });
+                            console.error(`Error processing existing file ${file.Key}:`, error);
+                        }
 
-                        const multerFile: Express.Multer.File = {
-                            fieldname: 'file',
-                            originalname: path.basename(file.Key),
-                            encoding: '7bit',
-                            mimetype: response.ContentType || 'application/pdf',
-                            size: response.ContentLength || 0,
-                            destination: tempDir,
-                            filename: path.basename(file.Key),
-                            path: tempFilePath,
-                            buffer: Buffer.from([]),
-                            stream: new Readable()
-                        };
-
-                        const result = await this.processDocument(multerFile, namespace);
-                        totalChunks += result.metadata.totalChunks;
-                        totalTokens += result.metadata.totalTokens;
-                        processedFiles++;
-
-                    } catch (error: any) {
-                        errors.push({
-                            file: file.Key,
-                            error: error.message
-                        });
-                        console.error(`Error processing existing file ${file.Key}:`, error);
                     }
+
                 }
 
                 // Process new files
@@ -510,7 +552,6 @@ export class DocumentProcessor
             throw new Error(`Failed to refresh documents: ${error.message}`);
         }
     }
-
     getCurrentUsage(): UsageMetrics
     {
         return { ...this.usageMetrics };
